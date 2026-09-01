@@ -179,6 +179,7 @@ func normalizeResponsesBody(c *gin.Context, state *AppState, headers http.Header
 	}
 	delete(object, "safety_identifier")
 	delete(object, "generate")
+	delete(object, "max_output_tokens")
 	conversationMode := state.Config.ConversationMode
 	if raw, exists := object["conversation_mode"]; exists {
 		value, valid := raw.(string)
