@@ -35,7 +35,8 @@ chaining.
   account affinity.
 - `internal/app/core/upstream.go`: shared authenticated upstream request and
   failover policy.
-- `internal/app/core/models.go`: dynamic catalog cache and capability endpoints.
+- `internal/app/core/models.go`: dynamic catalog cache, Crush-compatible model
+  capability metadata, and capability endpoints.
 - `internal/app/handlers/proxy.go`: native Responses HTTP/SSE and compact
   handling.
 - `internal/app/handlers/websocket.go`: Responses WebSocket-to-HTTP/SSE bridge.

@@ -14,10 +14,17 @@ import (
 )
 
 type OpenAIModel struct {
-	ID      string `json:"id"`
-	Object  string `json:"object"`
-	Created uint64 `json:"created"`
-	OwnedBy string `json:"owned_by"`
+	ID                     string   `json:"id"`
+	Object                 string   `json:"object"`
+	Created                uint64   `json:"created"`
+	OwnedBy                string   `json:"owned_by"`
+	Name                   string   `json:"name,omitempty"`
+	ContextWindow          *uint64  `json:"context_window,omitempty"`
+	DefaultMaxTokens       *uint64  `json:"default_max_tokens,omitempty"`
+	CanReason              bool     `json:"can_reason,omitempty"`
+	ReasoningLevels        []string `json:"reasoning_levels,omitempty"`
+	DefaultReasoningEffort string   `json:"default_reasoning_effort,omitempty"`
+	SupportsAttachments    *bool    `json:"supports_attachments,omitempty"`
 }
 
 type modelList struct {
@@ -100,6 +107,9 @@ func (c *ModelsCache) getOrFetch(ctx context.Context, state *AppState, auth Auth
 
 type upstreamModel struct {
 	Slug                       string   `json:"slug"`
+	Name                       string   `json:"name"`
+	DisplayName                string   `json:"display_name"`
+	Title                      string   `json:"title"`
 	SupportedInAPI             *bool    `json:"supported_in_api"`
 	Hidden                     *bool    `json:"hidden"`
 	Visibility                 string   `json:"visibility"`
@@ -222,9 +232,30 @@ func fetchModelCatalog(ctx context.Context, state *AppState, auth AuthTokens) (m
 			effortList = reasoningEfforts
 		}
 		catalog.Capabilities = append(catalog.Capabilities, ModelCapabilities{ID: model.Slug, ContextWindow: contextWindow, MaxOutputTokens: model.MaxOutputTokens, Reasoning: reasoning, ReasoningEfforts: effortList, DefaultReasoningEffort: defaultEffort, SupportsTools: model.SupportsTools, SupportsParallelTools: parallel, SupportsImages: supportsImages, SupportsWebSearch: search, SupportsImageGeneration: supportsImageGeneration, SupportsPromptCache: model.SupportsPromptCache, SupportsResponsesWS: ws})
-		catalog.Models = append(catalog.Models, OpenAIModel{ID: model.Slug, Object: "model", Created: 0, OwnedBy: "openai"})
+		catalog.Models = append(catalog.Models, OpenAIModel{
+			ID:                     model.Slug,
+			Object:                 "model",
+			Created:                0,
+			OwnedBy:                "openai",
+			Name:                   modelDisplayName(model),
+			ContextWindow:          contextWindow,
+			DefaultMaxTokens:       model.MaxOutputTokens,
+			CanReason:              reasoning != nil && *reasoning,
+			ReasoningLevels:        effortList,
+			DefaultReasoningEffort: defaultEffort,
+			SupportsAttachments:    supportsImages,
+		})
 	}
 	return catalog, nil
+}
+
+func modelDisplayName(model upstreamModel) string {
+	for _, value := range []string{model.Name, model.DisplayName, model.Title, model.Slug} {
+		if value = strings.TrimSpace(value); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func parseReasoningEfforts(values []any) []string {

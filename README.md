@@ -212,7 +212,11 @@ cproxy setup crush --base-url http://127.0.0.1:8080/v1
 ~~~
 
 The command prints an idempotent provider block. It does not edit Crush's
-configuration file automatically.
+configuration file automatically. The `/v1/models` response also includes
+optional capability metadata such as `can_reason`, `reasoning_levels`, and
+`default_reasoning_effort`. Crush builds that metadata into its reasoning
+picker only when its discovery implementation preserves provider model fields;
+otherwise define the model explicitly in Crush configuration.
 
 ## Configuration
 
@@ -365,7 +369,7 @@ curl -H "Authorization: Bearer $proxy_key" \
 | `GET` | `/ready`, `/readyz` | Authentication readiness; no proxy key required. |
 | `GET` | `/metrics` | Prometheus metrics. |
 | `GET` | `/usage`, `/v1/usage` | Codex limits and credits. |
-| `GET` | `/v1/models` | Cached dynamic OpenAI model list. |
+| `GET` | `/v1/models` | Cached dynamic OpenAI model list with optional capability metadata. |
 | `GET` | `/v1/capabilities` | Discovered capabilities for all models. |
 | `GET` | `/v1/models/{model}/capabilities` | Capabilities for one model. |
 | `POST` | `/v1/responses` | Native Responses API with SSE streaming. |
