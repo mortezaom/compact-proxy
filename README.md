@@ -167,7 +167,7 @@ cproxy serve --config ./config.toml --host 127.0.0.1 --port 9000
 | `login-device` | Authenticate with a device code, for headless use. |
 | `auth status` | Show configured auth status and token expiry. |
 | `logout` | Revoke the primary account token and remove the primary auth file. |
-| `setup crush` | Print a Crush provider configuration block. |
+| `setup crush` | Print Crush provider and explicit model configuration. |
 
 ### `serve` options
 
@@ -211,12 +211,21 @@ cproxy setup crush
 cproxy setup crush --base-url http://127.0.0.1:8080/v1
 ~~~
 
-The command prints an idempotent provider block. It does not edit Crush's
-configuration file automatically. The `/v1/models` response also includes
-optional capability metadata such as `can_reason`, `reasoning_levels`, and
-`default_reasoning_effort`. Crush builds that metadata into its reasoning
-picker only when its discovery implementation preserves provider model fields;
-otherwise define the model explicitly in Crush configuration.
+The command prints an idempotent provider block and, when the proxy is
+running, fetches `/v1/models` to print one `model add` command per model for
+`crushrc`, including its scalar metadata. It also prints a complete
+`crush.json` provider block so the `reasoning_levels` array can be preserved.
+It does not edit Crush's configuration file automatically. If the proxy is
+not running yet, it prints the provider block and asks you to run setup again
+after starting it.
+
+The `/v1/models` response also includes optional capability metadata such as
+`can_reason`, `reasoning_levels`, and `default_reasoning_effort`. Crush builds
+that metadata into its reasoning picker only when its discovery implementation
+preserves provider model fields; the generated explicit model definitions work
+around clients that discard discovered fields. The context window is copied
+from the upstream catalog; `setup crush` does not replace it with an
+unverified larger value.
 
 ## Configuration
 

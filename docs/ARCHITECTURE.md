@@ -26,7 +26,9 @@ chaining.
 
 - `cmd/compact-proxy/main.go`: process entrypoint.
 - `internal/app/app.go`: CLI, routes, middleware, health, readiness, and Crush
-  setup.
+  setup orchestration.
+- `internal/app/crush_setup.go`: model metadata discovery and explicit
+  `crush.json` configuration generation.
 - `internal/app/core/auth.go`: PKCE/device OAuth, persistence, refresh,
   revocation, and accounts.
 - `internal/app/core/config.go`: TOML/environment resolution, shared clients,

@@ -275,12 +275,37 @@ func runSetup(args []string, config Config) error {
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
 	}
+	proxyAPIKey := getProxyAPIKey(config)
 	fmt.Println("Add this to ~/.config/crush/crushrc:")
 	fmt.Println()
 	fmt.Println("provider add codex-proxy \\")
 	fmt.Println("  --type openai \\")
 	fmt.Printf("  --base-url %q \\\n", *baseURL)
-	fmt.Printf("  --api-key %q \\\n", getProxyAPIKey(config))
+	fmt.Printf("  --api-key %q \\\n", proxyAPIKey)
 	fmt.Println("  --discover-models true")
+
+	fmt.Println()
+	fmt.Println("Fetching model metadata for an explicit Crush model configuration...")
+	models, err := discoverCrushModels(*baseURL, proxyAPIKey)
+	if err != nil {
+		fmt.Printf("Could not fetch model metadata: %v\n", err)
+		fmt.Println("Start the proxy and run `cproxy setup crush` again to include explicit reasoning levels.")
+		return nil
+	}
+	if len(models) == 0 {
+		fmt.Println("The proxy returned no models; run setup again after models are available.")
+		return nil
+	}
+	fmt.Println()
+	fmt.Println("Add these explicit model definitions to crushrc for scalar metadata:")
+	fmt.Println(marshalCrushrcModels(models))
+	fmt.Println()
+	configJSON, err := marshalCrushConfig(*baseURL, proxyAPIKey, models)
+	if err != nil {
+		return fmt.Errorf("build Crush model configuration: %w", err)
+	}
+	fmt.Println("The crushrc commands above cannot carry reasoning_levels with current Crush flags.")
+	fmt.Println("Merge this JSON into crush.json when you need the full reasoning-level picker:")
+	fmt.Println(string(configJSON))
 	return nil
 }
