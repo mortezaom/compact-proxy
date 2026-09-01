@@ -1,0 +1,29 @@
+# Go build output
+/build/
+*.test
+
+# Local configuration and secrets
+/config.toml
+/.compact-proxy/
+auth*.json
+proxy-api-key
+*.pem
+*.key
+.env
+.env.local
+.env.*.local
+
+# Development output
+*.log
+/tmp/
+*.tmp
+*.temp
+
+# Editors and operating-system files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

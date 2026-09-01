@@ -1,0 +1,29 @@
+# The application creates ~/.compact-proxy/config.toml with these defaults.
+# Use this file with --config when you want a separate configuration.
+#
+# Resolution order:
+# defaults < this file < environment variables < command-line flags
+
+[server]
+# Bind locally by default. Use 0.0.0.0 only with network controls.
+host = "127.0.0.1"
+port = 8080
+# Leave empty to fetch the current Codex client version from npm.
+codex_version = ""
+
+[auth]
+# Relative auth and backup paths are resolved from ~/.compact-proxy.
+file = "auth.json"
+# Add additional Codex-compatible auth files in fallback order.
+files = []
+
+[security]
+# Prefer PROXY_API_KEY or a secret manager for deployments.
+# api_key = "replace-me"
+# Relative key paths are resolved from ~/.compact-proxy.
+api_key_file = "proxy-api-key"
+
+[defaults]
+reasoning_effort = ""
+conversation_mode = "client"
+usage_model = "gpt-5.5"
