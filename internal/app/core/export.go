@@ -3,8 +3,11 @@ package core
 var (
 	DecodeJSON              = decodeJSON
 	ReadAll                 = readAll
+	LogDebug                = logDebug
 	LogInfo                 = logInfo
 	LogWarn                 = logWarn
+	SetLogLevel             = setLogLevel
+	WithRequestID           = withRequestID
 	WriteJSONError          = writeJSONError
 	WriteUpstreamError      = writeUpstreamError
 	ConstantTimeEqual       = constantTimeEqual
@@ -26,6 +29,7 @@ var (
 	StreamSSEBody           = streamSSEBody
 	SSEData                 = sseData
 	InjectPromptCacheKey    = injectPromptCacheKey
+	PromptCacheKeyLogID     = promptCacheKeyLogID
 	HandleModels            = handleModels
 	HandleCapabilities      = handleCapabilities
 	HandleModelCapabilities = handleModelCapabilities

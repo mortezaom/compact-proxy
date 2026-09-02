@@ -166,10 +166,13 @@ type functionResponse struct {
 func handleChatCompletions(c *gin.Context, state *AppState) {
 	var request ChatRequest
 	if err := decodeJSON(c.Request.Body, &request); err != nil {
+		logRequestWarn(c, "chat request rejected: reason=invalid_json error=%v", err)
 		invalidRequest(c, "invalid JSON request: "+err.Error())
 		return
 	}
+	logRequestDebug(c, "chat request received: model=%s stream=%t messages=%d tools=%d include_usage=%t", request.Model, request.Stream, len(request.Messages), len(request.Tools), request.StreamOptions != nil && request.StreamOptions.IncludeUsage != nil && *request.StreamOptions.IncludeUsage)
 	if validateChatRequest(c, &request) {
+		logRequestWarn(c, "chat request rejected: reason=validation")
 		return
 	}
 	streamIncludeUsage := request.StreamOptions != nil && request.StreamOptions.IncludeUsage != nil && *request.StreamOptions.IncludeUsage
@@ -180,17 +183,25 @@ func handleChatCompletions(c *gin.Context, state *AppState) {
 	if responseWritten {
 		return
 	}
-	logInfo("forwarding Chat Completions request: model=%s stream=%t reasoning_effort=%s cache_key=%s", request.Model, request.Stream, stringValue(normalized.ReasoningEffort), normalized.CacheKeySource)
+	logRequestInfo(c, "forwarding endpoint=chat_completions model_requested=%s model=%s model_source=%s stream_requested=%t stream_forwarded=%t messages=%d translated_input_items=%d tools=%d reasoning_source=%s reasoning_effort=%s cache_key_source=%s cache_key_id=%s", request.Model, stringValue(normalized.Model), normalized.ModelSource, request.Stream, normalized.StreamForwarded, len(request.Messages), lenAnySlice(normalized.Body["input"]), len(request.Tools), normalized.ReasoningSource, stringValue(normalized.ReasoningEffort), normalized.CacheKeySource, normalized.CacheKeyID)
 	upstream, upstreamErr := sendJSON(c.Request.Context(), state, c.Request.Header, "responses", normalized.Body, true)
 	if upstreamErr != nil {
+		logRequestWarn(c, "chat upstream failed: status=%d type=%s", upstreamErr.Status, upstreamErr.ErrorType)
 		writeUpstreamError(c, upstreamErr)
 		return
 	}
 	if request.Stream {
+		logRequestDebug(c, "chat response mode=stream include_usage=%t", streamIncludeUsage)
 		streamChat(c, upstream, responseID, request.Model, streamIncludeUsage, state.Metrics)
 		return
 	}
+	logRequestDebug(c, "chat response mode=collect")
 	collectChat(c, upstream, responseID, request.Model)
+}
+
+func lenAnySlice(value any) int {
+	items, _ := value.([]any)
+	return len(items)
 }
 
 func validateChatRequest(c *gin.Context, request *ChatRequest) bool {
@@ -214,9 +225,9 @@ func buildChatResponsesBody(request *ChatRequest) map[string]any {
 	instructions, input := translateMessages(request.Messages)
 	body := map[string]any{"model": model, "instructions": instructions, "input": input, "stream": true, "store": false}
 	if request.ReasoningEffort != nil {
-		body["reasoning"] = map[string]any{"effort": *request.ReasoningEffort}
+		body["reasoning_effort"] = *request.ReasoningEffort
 	} else if suffixEffort != nil {
-		body["reasoning"] = map[string]any{"effort": *suffixEffort}
+		body["reasoning_effort"] = *suffixEffort
 	}
 	if request.PromptCacheKey != nil {
 		body["prompt_cache_key"] = *request.PromptCacheKey
@@ -350,21 +361,37 @@ type chatToolState struct {
 	SawArguments bool
 }
 type chatStreamState struct {
-	ID            string
-	Model         string
-	IncludeUsage  bool
-	Tools         map[string]chatToolState
-	LastTool      string
-	NextToolIndex uint32
-	SawToolCall   bool
-	Completed     bool
+	ID                 string
+	Model              string
+	IncludeUsage       bool
+	Tools              map[string]chatToolState
+	LastTool           string
+	NextToolIndex      uint32
+	SawToolCall        bool
+	Completed          bool
+	Frames             int
+	Events             int
+	InvalidEvents      int
+	TextDeltas         int
+	ReasoningDeltas    int
+	ToolCallEvents     int
+	ToolArgumentDeltas int
 }
 
 func streamChat(c *gin.Context, upstream *http.Response, responseID, model string, includeUsage bool, metrics *Metrics) {
+	started := time.Now()
 	defer upstream.Body.Close()
 	guard := newStreamGuard(metrics)
 	defer guard.close()
 	state := &chatStreamState{ID: responseID, Model: model, IncludeUsage: includeUsage, Tools: make(map[string]chatToolState)}
+	outcome := "client_disconnect"
+	defer func() {
+		finishReason := "stop"
+		if state.SawToolCall {
+			finishReason = "tool_calls"
+		}
+		logRequestDebug(c, "chat stream ended: outcome=%s model=%s frames=%d events=%d invalid_events=%d text_deltas=%d reasoning_deltas=%d tool_call_events=%d tool_argument_deltas=%d finish_reason=%s duration_ms=%d", outcome, model, state.Frames, state.Events, state.InvalidEvents, state.TextDeltas, state.ReasoningDeltas, state.ToolCallEvents, state.ToolArgumentDeltas, finishReason, time.Since(started).Milliseconds())
+	}()
 	c.Status(http.StatusOK)
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
@@ -387,11 +414,14 @@ func streamChat(c *gin.Context, upstream *http.Response, responseID, model strin
 		return nil
 	})
 	if err != nil {
+		outcome = "stream_error"
+		logRequestWarn(c, "chat stream failed: error=%v", err)
 		guard.complete()
 		_ = write("data: {\"error\":{\"message\":\"stream error: " + escapeJSONString(err.Error()) + "\"}}\n\ndata: [DONE]\n\n")
 		return
 	}
 	if !state.Completed {
+		outcome = "completed_with_synthetic_finish"
 		state.Completed = true
 		reason := "stop"
 		if state.SawToolCall {
@@ -399,10 +429,14 @@ func streamChat(c *gin.Context, upstream *http.Response, responseID, model strin
 		}
 		_ = write(finalChatStreamChunk(state.ID, state.Model, nil, reason, state.IncludeUsage))
 	}
+	if outcome == "client_disconnect" {
+		outcome = "completed"
+	}
 	guard.complete()
 }
 
 func translateChatFrame(frame string, state *chatStreamState) string {
+	state.Frames++
 	var output strings.Builder
 	for _, data := range sseData(frame) {
 		if data == "[DONE]" {
@@ -411,8 +445,10 @@ func translateChatFrame(frame string, state *chatStreamState) string {
 		}
 		var event map[string]any
 		if json.Unmarshal([]byte(data), &event) != nil {
+			state.InvalidEvents++
 			continue
 		}
+		state.Events++
 		eventType := stringFromAny(event["type"])
 		switch eventType {
 		case "response.created":
@@ -424,6 +460,7 @@ func translateChatFrame(frame string, state *chatStreamState) string {
 				continue
 			}
 			state.SawToolCall = true
+			state.ToolCallEvents++
 			name := stringFromAny(item["name"])
 			id := stringFromAny(item["call_id"])
 			if id == "" {
@@ -440,13 +477,16 @@ func translateChatFrame(frame string, state *chatStreamState) string {
 			callType := "function"
 			output.WriteString(chatChunkJSON(state.ID, state.Model, delta{ToolCalls: []deltaToolCall{{Index: index, ID: stringPointer(id), CallType: &callType, Function: &deltaFunction{Name: stringPointer(name), Arguments: stringPointer("")}}}}))
 		case "response.output_text.delta":
+			state.TextDeltas++
 			text := stringFromAny(event["delta"])
 			output.WriteString(chatChunkJSON(state.ID, state.Model, delta{Content: stringPointer(text)}))
 		case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+			state.ReasoningDeltas++
 			text := stringFromAny(event["delta"])
 			output.WriteString(chatChunkJSON(state.ID, state.Model, delta{ReasoningContent: stringPointer(text)}))
 		case "response.function_call_arguments.delta":
 			state.SawToolCall = true
+			state.ToolArgumentDeltas++
 			args := stringFromAny(event["delta"])
 			key := stringFromAny(event["call_id"])
 			if key == "" {
@@ -474,6 +514,7 @@ func translateChatFrame(frame string, state *chatStreamState) string {
 				continue
 			}
 			state.SawToolCall = true
+			state.ToolCallEvents++
 			id := stringFromAny(item["call_id"])
 			if id == "" {
 				id = stringFromAny(item["id"])
@@ -538,23 +579,35 @@ func finalChatStreamChunk(id, model string, rawUsage any, finishReason string, i
 }
 
 func collectChat(c *gin.Context, upstream *http.Response, responseID, model string) {
+	started := time.Now()
+	eventCount := 0
+	invalidEventCount := 0
+	textDeltaCount := 0
+	reasoningDeltaCount := 0
+	toolCallCount := 0
+	outcome := "error"
+	content, reasoning := "", ""
+	var toolCalls []toolCallResponse
+	var usage *Usage
+	finishReason := "stop"
+	defer func() {
+		logRequestDebug(c, "chat collection ended: outcome=%s model=%s status=%d events=%d invalid_events=%d text_deltas=%d reasoning_deltas=%d tool_calls=%d finish_reason=%s content_bytes=%d reasoning_bytes=%d duration_ms=%d", outcome, model, upstream.StatusCode, eventCount, invalidEventCount, textDeltaCount, reasoningDeltaCount, toolCallCount, finishReason, len(content), len(reasoning), time.Since(started).Milliseconds())
+	}()
 	defer upstream.Body.Close()
 	if upstream.StatusCode < 200 || upstream.StatusCode >= 300 {
 		body, _ := io.ReadAll(upstream.Body)
+		logRequestWarn(c, "chat collection received upstream error: status=%d body_bytes=%d", upstream.StatusCode, len(body))
 		c.Data(upstream.StatusCode, "application/json", []byte(`{"error":{"message":`+jsonString(string(body))+`}}`))
 		return
 	}
 	raw, err := io.ReadAll(upstream.Body)
 	if err != nil {
+		logRequestWarn(c, "chat collection read failed: error=%v", err)
 		writeJSONError(c, http.StatusBadGateway, "upstream_error", "failed to read upstream: "+err.Error(), "")
 		return
 	}
-	content, reasoning := "", ""
-	var toolCalls []toolCallResponse
 	indexes := make(map[string]int)
 	var lastToolIndex *int
-	var usage *Usage
-	finishReason := "stop"
 	for _, line := range strings.Split(string(raw), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, ":") || !strings.HasPrefix(line, "data: ") {
@@ -566,10 +619,13 @@ func collectChat(c *gin.Context, upstream *http.Response, responseID, model stri
 		}
 		var event map[string]any
 		if json.Unmarshal([]byte(data), &event) != nil {
+			invalidEventCount++
 			continue
 		}
+		eventCount++
 		switch stringFromAny(event["type"]) {
 		case "response.output_text.delta":
+			textDeltaCount++
 			content += stringFromAny(event["delta"])
 		case "response.output_item.added":
 			item, _ := event["item"].(map[string]any)
@@ -582,12 +638,14 @@ func collectChat(c *gin.Context, upstream *http.Response, responseID, model stri
 			}
 			index := len(toolCalls)
 			toolCalls = append(toolCalls, toolCallResponse{ID: id, CallType: "function", Function: functionResponse{Name: stringFromAny(item["name"])}})
+			toolCallCount++
 			indexes[id] = index
 			if itemID := stringFromAny(item["id"]); itemID != "" {
 				indexes[itemID] = index
 			}
 			lastToolIndex = &index
 		case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+			reasoningDeltaCount++
 			reasoning += stringFromAny(event["delta"])
 		case "response.function_call_arguments.delta":
 			key := stringFromAny(event["call_id"])
@@ -647,6 +705,7 @@ func collectChat(c *gin.Context, upstream *http.Response, responseID, model stri
 		usage = &Usage{}
 	}
 	c.JSON(http.StatusOK, chatCompletionResponse{ID: responseID, Object: "chat.completion", Created: nowEpoch(), Model: model, Choices: []completionChoice{{Index: 0, Message: message, FinishReason: finishReason}}, Usage: *usage})
+	outcome = "completed"
 }
 
 func mapUsage(value any) *Usage {

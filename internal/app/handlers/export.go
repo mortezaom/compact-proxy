@@ -13,6 +13,7 @@ type UpstreamError = core.UpstreamError
 var (
 	decodeJSON             = core.DecodeJSON
 	readAll                = core.ReadAll
+	logDebug               = core.LogDebug
 	logInfo                = core.LogInfo
 	logWarn                = core.LogWarn
 	writeJSONError         = core.WriteJSONError
@@ -25,6 +26,7 @@ var (
 	streamSSEBody          = core.StreamSSEBody
 	sseData                = core.SSEData
 	injectPromptCacheKey   = core.InjectPromptCacheKey
+	promptCacheKeyLogID    = core.PromptCacheKeyLogID
 )
 
 type streamGuard struct {
@@ -37,6 +39,28 @@ func newStreamGuard(metrics *Metrics) *streamGuard {
 
 func (g *streamGuard) complete() { g.inner.Complete() }
 func (g *streamGuard) close()    { g.inner.Close() }
+
+func requestLogID(c *gin.Context) string {
+	if c == nil {
+		return "unknown"
+	}
+	if value := c.GetHeader("x-request-id"); value != "" {
+		return value
+	}
+	return "unknown"
+}
+
+func logRequestDebug(c *gin.Context, format string, args ...any) {
+	logDebug("request_id=%s "+format, append([]any{requestLogID(c)}, args...)...)
+}
+
+func logRequestInfo(c *gin.Context, format string, args ...any) {
+	logInfo("request_id=%s "+format, append([]any{requestLogID(c)}, args...)...)
+}
+
+func logRequestWarn(c *gin.Context, format string, args ...any) {
+	logWarn("request_id=%s "+format, append([]any{requestLogID(c)}, args...)...)
+}
 
 func HandleResponses(c *gin.Context, state *AppState) { handleResponses(c, state) }
 func HandleCompact(c *gin.Context, state *AppState)   { handleCompact(c, state) }

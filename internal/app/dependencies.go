@@ -16,7 +16,10 @@ var (
 	revokeToken              = core.RevokeToken
 	deleteAuthToken          = core.DeleteAuthToken
 	logInfo                  = core.LogInfo
+	logDebug                 = core.LogDebug
 	logWarn                  = core.LogWarn
+	setLogLevel              = core.SetLogLevel
+	withRequestID            = core.WithRequestID
 	makeState                = core.MakeState
 	spawnVersionRefresher    = core.SpawnVersionRefresher
 	getProxyAPIKey           = core.GetProxyAPIKey

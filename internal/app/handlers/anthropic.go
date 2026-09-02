@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -33,10 +34,13 @@ type anthropicTool struct {
 func handleMessages(c *gin.Context, state *AppState) {
 	var request MessagesRequest
 	if err := decodeJSON(c.Request.Body, &request); err != nil {
+		logRequestWarn(c, "anthropic request rejected: reason=invalid_json error=%v", err)
 		anthropicError(c, http.StatusBadRequest, "invalid_request_error", "invalid JSON request: "+err.Error())
 		return
 	}
+	logRequestDebug(c, "anthropic request received: model=%s stream=%t messages=%d tools=%d max_tokens=%d", request.Model, request.Stream, len(request.Messages), len(request.Tools), request.MaxTokens)
 	if request.MaxTokens == 0 {
+		logRequestWarn(c, "anthropic request rejected: reason=max_tokens_missing")
 		anthropicError(c, http.StatusBadRequest, "invalid_request_error", "max_tokens must be greater than zero")
 		return
 	}
@@ -46,16 +50,19 @@ func handleMessages(c *gin.Context, state *AppState) {
 	if responseWritten {
 		return
 	}
-	logInfo("forwarding Anthropic Messages request: model=%s stream=%t reasoning_effort=%s cache_key=%s", request.Model, request.Stream, stringValue(normalized.ReasoningEffort), normalized.CacheKeySource)
+	logRequestInfo(c, "forwarding endpoint=anthropic_messages model_requested=%s model=%s model_source=%s stream_requested=%t stream_forwarded=%t messages=%d translated_input_items=%d tools=%d reasoning_source=%s reasoning_effort=%s cache_key_source=%s cache_key_id=%s", request.Model, stringValue(normalized.Model), normalized.ModelSource, request.Stream, normalized.StreamForwarded, len(request.Messages), lenAnySlice(normalized.Body["input"]), len(request.Tools), normalized.ReasoningSource, stringValue(normalized.ReasoningEffort), normalized.CacheKeySource, normalized.CacheKeyID)
 	upstream, upstreamErr := sendJSON(c.Request.Context(), state, c.Request.Header, "responses", normalized.Body, true)
 	if upstreamErr != nil {
+		logRequestWarn(c, "anthropic upstream failed: status=%d type=%s", upstreamErr.Status, upstreamErr.ErrorType)
 		anthropicError(c, upstreamErr.Status, upstreamErr.ErrorType, upstreamErr.Message)
 		return
 	}
 	if request.Stream {
+		logRequestDebug(c, "anthropic response mode=stream")
 		streamAnthropic(c, upstream, request.Model, state.Metrics)
 		return
 	}
+	logRequestDebug(c, "anthropic response mode=collect")
 	collectAnthropic(c, upstream, request.Model)
 }
 
@@ -87,7 +94,7 @@ func translateAnthropicRequest(request *MessagesRequest) map[string]any {
 	}
 	if config, ok := request.OutputConfig.(map[string]any); ok {
 		if effort, ok := config["effort"].(string); ok {
-			body["reasoning"] = map[string]any{"effort": effort}
+			body["reasoning_effort"] = effort
 		}
 	}
 	return body
@@ -184,34 +191,50 @@ func extractAnthropicText(value any) string {
 }
 
 func collectAnthropic(c *gin.Context, upstream *http.Response, model string) {
+	started := time.Now()
+	eventCount := 0
+	invalidEventCount := 0
+	textDeltaCount := 0
+	reasoningDeltaCount := 0
+	toolCount := 0
+	outcome := "error"
+	text, thinking := "", ""
+	var tools []any
+	defer func() {
+		logRequestDebug(c, "anthropic collection ended: outcome=%s model=%s status=%d events=%d invalid_events=%d text_deltas=%d reasoning_deltas=%d tool_calls=%d text_bytes=%d thinking_bytes=%d duration_ms=%d", outcome, model, upstream.StatusCode, eventCount, invalidEventCount, textDeltaCount, reasoningDeltaCount, toolCount, len(text), len(thinking), time.Since(started).Milliseconds())
+	}()
 	defer upstream.Body.Close()
 	raw, err := io.ReadAll(upstream.Body)
 	if err != nil {
+		logRequestWarn(c, "anthropic collection read failed: error=%v", err)
 		anthropicError(c, http.StatusBadGateway, "api_error", "failed to read upstream response: "+err.Error())
 		return
 	}
 	id := "msg_" + randomHex(12)
-	text, thinking := "", ""
-	var tools []any
 	usage := map[string]any(nil)
 	stopReason := "end_turn"
 	for _, data := range dataLines(string(raw)) {
 		var event map[string]any
 		if json.Unmarshal([]byte(data), &event) != nil {
+			invalidEventCount++
 			continue
 		}
+		eventCount++
 		switch stringFromAny(event["type"]) {
 		case "response.created":
 			if response, ok := event["response"].(map[string]any); ok && stringFromAny(response["id"]) != "" {
 				id = stringFromAny(response["id"])
 			}
 		case "response.output_text.delta":
+			textDeltaCount++
 			text += stringFromAny(event["delta"])
 		case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+			reasoningDeltaCount++
 			thinking += stringFromAny(event["delta"])
 		case "response.output_item.done":
 			item, _ := event["item"].(map[string]any)
 			if item["type"] == "function_call" {
+				toolCount++
 				input := map[string]any{}
 				_ = json.Unmarshal([]byte(stringFromAny(item["arguments"])), &input)
 				idValue := item["call_id"]
@@ -246,6 +269,7 @@ func collectAnthropic(c *gin.Context, upstream *http.Response, model string) {
 		usage = map[string]any{"input_tokens": 0, "output_tokens": 0}
 	}
 	c.JSON(http.StatusOK, map[string]any{"id": id, "type": "message", "role": "assistant", "model": model, "content": content, "stop_reason": stopReason, "stop_sequence": nil, "usage": usage})
+	outcome = "completed"
 }
 
 func dataLines(raw string) []string {
@@ -267,19 +291,32 @@ type anthropicToolState struct {
 	SawArguments, Stopped bool
 }
 type anthropicStreamState struct {
-	Model, ID                string
-	Tools                    map[string]anthropicToolState
-	NextIndex                uint32
-	TextIndex, ThinkingIndex *uint32
-	Started, Completed       bool
-	Pending                  string
+	Model, ID                     string
+	Tools                         map[string]anthropicToolState
+	NextIndex                     uint32
+	TextIndex, ThinkingIndex      *uint32
+	Started, Completed            bool
+	Pending                       string
+	Frames, Events                int
+	InvalidEvents                 int
+	TextDeltas, ThinkingDeltas    int
+	ToolCalls, ToolArgumentDeltas int
 }
 
 func streamAnthropic(c *gin.Context, upstream *http.Response, model string, metrics *Metrics) {
+	started := time.Now()
 	defer upstream.Body.Close()
 	guard := newStreamGuard(metrics)
 	defer guard.close()
 	state := &anthropicStreamState{Model: model, ID: "msg_" + randomHex(12), Tools: make(map[string]anthropicToolState)}
+	outcome := "client_disconnect"
+	defer func() {
+		reason := "end_turn"
+		if len(state.Tools) > 0 {
+			reason = "tool_use"
+		}
+		logRequestDebug(c, "anthropic stream ended: outcome=%s model=%s frames=%d events=%d invalid_events=%d text_deltas=%d thinking_deltas=%d tool_calls=%d tool_argument_deltas=%d stop_reason=%s duration_ms=%d", outcome, model, state.Frames, state.Events, state.InvalidEvents, state.TextDeltas, state.ThinkingDeltas, state.ToolCalls, state.ToolArgumentDeltas, reason, time.Since(started).Milliseconds())
+	}()
 	c.Status(http.StatusOK)
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
@@ -295,11 +332,14 @@ func streamAnthropic(c *gin.Context, upstream *http.Response, model string, metr
 	}
 	err := streamSSEBody(upstream.Body, func(frame string) error { return write(translateAnthropicFrame(frame, state)) })
 	if err != nil {
+		outcome = "stream_error"
+		logRequestWarn(c, "anthropic stream failed: error=%v", err)
 		guard.complete()
 		_ = write(anthropicEvent("error", map[string]any{"type": "error", "error": map[string]any{"type": "api_error", "message": err.Error()}}))
 		return
 	}
 	if !state.Completed {
+		outcome = "completed_with_synthetic_finish"
 		reason := "end_turn"
 		if len(state.Tools) > 0 {
 			reason = "tool_use"
@@ -307,11 +347,15 @@ func streamAnthropic(c *gin.Context, upstream *http.Response, model string, metr
 		finishAnthropicStream(state, reason, nil)
 		_ = write(statePending(state))
 	}
+	if outcome == "client_disconnect" {
+		outcome = "completed"
+	}
 	guard.complete()
 }
 
 // translateAnthropicFrame returns all events generated for one upstream SSE frame.
 func translateAnthropicFrame(frame string, state *anthropicStreamState) string {
+	state.Frames++
 	var output strings.Builder
 	for _, data := range sseData(frame) {
 		if data == "[DONE]" {
@@ -319,8 +363,10 @@ func translateAnthropicFrame(frame string, state *anthropicStreamState) string {
 		}
 		var event map[string]any
 		if json.Unmarshal([]byte(data), &event) != nil {
+			state.InvalidEvents++
 			continue
 		}
+		state.Events++
 		switch stringFromAny(event["type"]) {
 		case "response.created":
 			if response, ok := event["response"].(map[string]any); ok && stringFromAny(response["id"]) != "" {
@@ -328,16 +374,22 @@ func translateAnthropicFrame(frame string, state *anthropicStreamState) string {
 			}
 			ensureAnthropicMessageStart(state, &output)
 		case "response.output_text.delta":
+			state.TextDeltas++
 			ensureAnthropicMessageStart(state, &output)
 			index := ensureAnthropicTextBlock(state, false, &output)
 			output.WriteString(anthropicEvent("content_block_delta", map[string]any{"type": "content_block_delta", "index": index, "delta": map[string]any{"type": "text_delta", "text": event["delta"]}}))
 		case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+			state.ThinkingDeltas++
 			ensureAnthropicMessageStart(state, &output)
 			index := ensureAnthropicTextBlock(state, true, &output)
 			output.WriteString(anthropicEvent("content_block_delta", map[string]any{"type": "content_block_delta", "index": index, "delta": map[string]any{"type": "thinking_delta", "thinking": event["delta"]}}))
 		case "response.output_item.added":
+			if item, ok := event["item"].(map[string]any); ok && item["type"] == "function_call" {
+				state.ToolCalls++
+			}
 			startAnthropicTool(state, event["item"], &output)
 		case "response.function_call_arguments.delta":
+			state.ToolArgumentDeltas++
 			key := stringFromAny(event["call_id"])
 			if key == "" {
 				key = stringFromAny(event["item_id"])
@@ -510,5 +562,6 @@ func mapAnthropicUsage(value any) map[string]any {
 	return result
 }
 func anthropicError(c *gin.Context, status int, errorType, message string) {
+	logRequestDebug(c, "anthropic error response: status=%d type=%s", status, errorType)
 	c.JSON(status, map[string]any{"type": "error", "error": map[string]any{"type": errorType, "message": message}})
 }

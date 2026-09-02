@@ -15,6 +15,8 @@
   catalog when a refresh temporarily fails.
 - Account affinity is in memory, capped at 4096 sessions, and expires after
   four hours.
+- `LOG_LEVEL=debug` exposes request-correlated routing, cache, model discovery,
+  upstream retry, and stream lifecycle summaries without logging content.
 
 ## Error handling
 

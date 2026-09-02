@@ -69,39 +69,53 @@ func (c *ModelsCache) capability(model string) *ModelCapabilities {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if c.entry == nil {
+		logDebug("model capability lookup: model=%s result=cache_empty", model)
 		return nil
 	}
 	for index := range c.entry.catalog.Capabilities {
 		if c.entry.catalog.Capabilities[index].ID == model {
 			result := c.entry.catalog.Capabilities[index]
+			logDebug("model capability lookup: model=%s result=hit reasoning_efforts=%d", model, len(result.ReasoningEfforts))
 			return &result
 		}
 	}
+	logDebug("model capability lookup: model=%s result=miss", model)
 	return nil
 }
 
 func (c *ModelsCache) getOrFetch(ctx context.Context, state *AppState, auth AuthTokens) (modelCatalog, error) {
+	requestID := requestIDFromContext(ctx)
 	c.mu.RLock()
-	if c.entry != nil && time.Since(c.entry.fetchedAt) < modelsCacheTTL {
-		catalog := c.entry.catalog
-		c.mu.RUnlock()
-		return catalog, nil
+	if c.entry != nil {
+		age := time.Since(c.entry.fetchedAt)
+		if age < modelsCacheTTL {
+			catalog := c.entry.catalog
+			c.mu.RUnlock()
+			logDebug("model catalog cache hit: request_id=%s age_ms=%d models=%d capabilities=%d", requestID, age.Milliseconds(), len(catalog.Models), len(catalog.Capabilities))
+			return catalog, nil
+		}
+		logDebug("model catalog cache expired: request_id=%s age_ms=%d ttl_minutes=%d", requestID, age.Milliseconds(), int64(modelsCacheTTL/time.Minute))
+	} else {
+		logDebug("model catalog cache miss: request_id=%s reason=empty", requestID)
 	}
 	c.mu.RUnlock()
 	state.Metrics.ModelDiscoveryRefreshTotal.Add(1)
+	logDebug("model catalog refresh started: request_id=%s account=%s", requestID, auth.accountAlias())
 	catalog, err := fetchModelCatalog(ctx, state, auth)
 	if err == nil {
 		c.mu.Lock()
 		c.entry = &cacheEntry{catalog: catalog, fetchedAt: time.Now()}
 		c.mu.Unlock()
+		logInfo("model catalog refresh completed: request_id=%s account=%s models=%d capabilities=%d", requestID, auth.accountAlias(), len(catalog.Models), len(catalog.Capabilities))
 		return catalog, nil
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if c.entry != nil {
-		logWarn("model discovery failed; serving stale cache: %v", err)
+		logWarn("model discovery failed; serving stale cache: request_id=%s account=%s age_ms=%d error=%v", requestID, auth.accountAlias(), time.Since(c.entry.fetchedAt).Milliseconds(), err)
 		return c.entry.catalog, nil
 	}
+	logWarn("model discovery failed with no cache: request_id=%s account=%s error=%v", requestID, auth.accountAlias(), err)
 	return modelCatalog{}, err
 }
 
@@ -134,43 +148,59 @@ type upstreamModel struct {
 }
 
 func fetchModelCatalog(ctx context.Context, state *AppState, auth AuthTokens) (modelCatalog, error) {
+	started := time.Now()
+	requestID := requestIDFromContext(ctx)
 	version := state.ClientVersion()
 	endpoint := upstreamBase + "/models?client_version=" + version
+	logDebug("model catalog upstream request started: request_id=%s account=%s client_version=%s", requestID, auth.accountAlias(), version)
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
+		logWarn("model catalog request construction failed: request_id=%s account=%s error=%v", requestID, auth.accountAlias(), err)
 		return modelCatalog{}, err
 	}
 	request.Header = buildAuthHeaders(auth, state.CodexUserAgent(), version)
 	response, err := state.HTTP.Do(request)
 	if err != nil {
+		logWarn("model catalog upstream request failed: request_id=%s account=%s duration_ms=%d error=%v", requestID, auth.accountAlias(), time.Since(started).Milliseconds(), err)
 		return modelCatalog{}, fmt.Errorf("upstream request failed: %w", err)
 	}
+	logDebug("model catalog upstream response: request_id=%s account=%s status=%d duration_ms=%d", requestID, auth.accountAlias(), response.StatusCode, time.Since(started).Milliseconds())
 	if response.StatusCode == http.StatusUnauthorized {
+		logInfo("model catalog upstream returned 401: request_id=%s account=%s action=refresh_once", requestID, auth.accountAlias())
 		response.Body.Close()
 		if refreshed, refreshErr := refreshExistingToken(auth, state.Config); refreshErr == nil {
 			state.Metrics.AuthRefreshTotal.Add(1)
+			logDebug("model catalog token refresh succeeded: request_id=%s account=%s", requestID, auth.accountAlias())
 			request, _ = http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 			request.Header = buildAuthHeaders(refreshed, state.CodexUserAgent(), version)
 			response, err = state.HTTP.Do(request)
 			if err != nil {
+				logWarn("model catalog retry failed: request_id=%s account=%s duration_ms=%d error=%v", requestID, auth.accountAlias(), time.Since(started).Milliseconds(), err)
 				return modelCatalog{}, fmt.Errorf("upstream retry failed: %w", err)
 			}
+			logDebug("model catalog retry response: request_id=%s account=%s status=%d duration_ms=%d", requestID, auth.accountAlias(), response.StatusCode, time.Since(started).Milliseconds())
+		} else {
+			logWarn("model catalog token refresh failed: request_id=%s account=%s error=%v", requestID, auth.accountAlias(), refreshErr)
 		}
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		logWarn("model catalog rejected: request_id=%s account=%s status=%d", requestID, auth.accountAlias(), response.StatusCode)
 		return modelCatalog{}, fmt.Errorf("upstream returned %s", response.Status)
 	}
 	var payload struct {
 		Models []upstreamModel `json:"models"`
 	}
 	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		logWarn("model catalog decode failed: request_id=%s account=%s error=%v", requestID, auth.accountAlias(), err)
 		return modelCatalog{}, fmt.Errorf("failed to parse upstream models response: %w", err)
 	}
 	seen := make(map[string]bool)
 	catalog := modelCatalog{Models: make([]OpenAIModel, 0, len(payload.Models)), Capabilities: make([]ModelCapabilities, 0, len(payload.Models))}
+	skipped := 0
 	for _, model := range payload.Models {
 		if strings.TrimSpace(model.Slug) == "" || (model.SupportedInAPI != nil && !*model.SupportedInAPI) || (model.Hidden != nil && *model.Hidden) || strings.EqualFold(model.Visibility, "hide") || strings.EqualFold(model.Visibility, "hidden") || seen[model.Slug] {
+			skipped++
 			continue
 		}
 		seen[model.Slug] = true
@@ -246,6 +276,7 @@ func fetchModelCatalog(ctx context.Context, state *AppState, auth AuthTokens) (m
 			SupportsAttachments:    supportsImages,
 		})
 	}
+	logDebug("model catalog normalized: request_id=%s account=%s upstream_models=%d exposed_models=%d skipped_models=%d capabilities=%d", requestID, auth.accountAlias(), len(payload.Models), len(catalog.Models), skipped, len(catalog.Capabilities))
 	return catalog, nil
 }
 
@@ -281,13 +312,17 @@ func catalogForRequest(ctx context.Context, state *AppState) (modelCatalog, erro
 	if err != nil {
 		return modelCatalog{}, newUpstreamError(http.StatusUnauthorized, err.Error(), "authentication_error", "")
 	}
+	requestID := requestIDFromContext(ctx)
+	logDebug("model catalog lookup started: request_id=%s candidates=%d", requestID, len(accounts))
 	var lastErr error
-	for _, account := range accounts {
+	for index, account := range accounts {
+		logDebug("model catalog account attempt: request_id=%s account=%s attempt=%d total=%d", requestID, account.accountAlias(), index+1, len(accounts))
 		catalog, fetchErr := state.ModelsCache.getOrFetch(ctx, state, account)
 		if fetchErr == nil {
+			logDebug("model catalog lookup succeeded: request_id=%s account=%s models=%d capabilities=%d", requestID, account.accountAlias(), len(catalog.Models), len(catalog.Capabilities))
 			return catalog, nil
 		}
-		logWarn("models fetch failed for account %s: %v", account.accountAlias(), fetchErr)
+		logWarn("models fetch failed: request_id=%s account=%s error=%v", requestID, account.accountAlias(), fetchErr)
 		lastErr = fetchErr
 	}
 	if lastErr == nil {
@@ -329,6 +364,7 @@ func handleModels(c *gin.Context, state *AppState) {
 		writeUpstreamError(c, err.(*UpstreamError))
 		return
 	}
+	logDebug("model endpoint response: request_id=%s endpoint=models models=%d", requestIDFromHeaders(c.Request.Header), len(catalog.Models))
 	c.JSON(http.StatusOK, modelList{Object: "list", Data: catalog.Models})
 }
 
@@ -338,6 +374,7 @@ func handleCapabilities(c *gin.Context, state *AppState) {
 		writeUpstreamError(c, err.(*UpstreamError))
 		return
 	}
+	logDebug("model endpoint response: request_id=%s endpoint=capabilities capabilities=%d", requestIDFromHeaders(c.Request.Header), len(catalog.Capabilities))
 	c.JSON(http.StatusOK, map[string]any{"object": "list", "data": catalog.Capabilities})
 }
 
@@ -350,9 +387,11 @@ func handleModelCapabilities(c *gin.Context, state *AppState) {
 	model := c.Param("model")
 	for _, capability := range catalog.Capabilities {
 		if capability.ID == model {
+			logDebug("model endpoint response: request_id=%s endpoint=model_capabilities model=%s result=found reasoning_efforts=%d", requestIDFromHeaders(c.Request.Header), model, len(capability.ReasoningEfforts))
 			c.JSON(http.StatusOK, capability)
 			return
 		}
 	}
+	logDebug("model endpoint response: request_id=%s endpoint=model_capabilities model=%s result=not_found", requestIDFromHeaders(c.Request.Header), model)
 	writeJSONError(c, http.StatusNotFound, "upstream_error", "model not found", "")
 }

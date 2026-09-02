@@ -8,6 +8,8 @@
 # Bind locally by default. Use 0.0.0.0 only with network controls.
 host = "127.0.0.1"
 port = 8080
+# Use "debug" for request and feature decision tracing.
+log_level = "info"
 # Leave empty to fetch the current Codex client version from npm.
 codex_version = ""
 

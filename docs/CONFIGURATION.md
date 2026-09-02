@@ -46,6 +46,7 @@ cproxy --config ./config.toml serve --host 127.0.0.1 --port 8080
 | --- | --- | --- |
 | server.host | 127.0.0.1 | Listener bind address |
 | server.port | 8080 | Listener port, from 1 through 65535 |
+| server.log_level | info | Log verbosity: debug, info, warn, or error |
 | server.codex_version | empty | Pin the client version; empty fetches it |
 | auth.file | auth.json | Primary auth file, relative to ~/.compact-proxy |
 | auth.files | empty list | Ordered additional auth files |
@@ -70,6 +71,7 @@ application uses `~/.compact-proxy/auth.json`.
 | --- | --- |
 | HOST | server.host |
 | PORT | server.port |
+| LOG_LEVEL | server.log_level |
 | CODEX_CLIENT_VERSION | server.codex_version |
 | CODEX_AUTH_FILE | auth.file |
 | CODEX_AUTH_FILES | auth.files, comma-separated |
@@ -83,6 +85,11 @@ These variables support local and container deployments. A non-empty
 environment value overrides the corresponding TOML value. CODEX_AUTH_FILES
 replaces the file list, so it does not unexpectedly merge accounts from two
 sources.
+
+Set `LOG_LEVEL=debug` to enable request and feature tracing. The debug records
+include routing decisions, cache-key source and safe hash, model-cache state,
+upstream attempts, and stream/translation counts without logging content or
+credentials.
 
 ## Security
 
@@ -107,6 +114,7 @@ contract, not merely change deployment behavior.
 [server]
 host = "127.0.0.1"
 port = 8080
+log_level = "info"
 codex_version = ""
 
 [auth]

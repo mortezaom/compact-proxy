@@ -26,6 +26,10 @@ func runCLI(args []string) error {
 	if err != nil {
 		return err
 	}
+	if err := setLogLevel(config.LogLevel); err != nil {
+		return err
+	}
+	logInfo("logging configured: level=%s", config.LogLevel)
 	switch args[0] {
 	case "serve":
 		return runServeCommand(args[1:], config)
@@ -129,6 +133,7 @@ func runServeCommand(args []string, config Config) error {
 func runServer(config Config) error {
 	state := makeState(config)
 	spawnVersionRefresher(state)
+	logInfo("proxy configuration: host=%s port=%d log_level=%s conversation_mode=%s usage_model=%s", config.Host, config.Port, config.LogLevel, config.ConversationMode, config.UsageModel)
 	key := getProxyAPIKey(config)
 	if key != "" {
 		logInfo("proxy API key auth enabled")
@@ -165,9 +170,11 @@ func requestContextMiddleware(state *AppState) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		id := requestID(c)
 		c.Request.Header.Set("x-request-id", id)
+		c.Request = c.Request.WithContext(withRequestID(c.Request.Context(), id))
 		started := time.Now()
 		state.Metrics.RequestsTotal.Add(1)
 		c.Header("x-request-id", id)
+		logDebug("request started: request_id=%s method=%s endpoint=%s content_length=%d", id, c.Request.Method, c.Request.URL.Path, c.Request.ContentLength)
 		c.Next()
 		c.Header("x-request-id", id)
 		logInfo("request completed: request_id=%s method=%s endpoint=%s status=%d latency_ms=%d", id, c.Request.Method, c.Request.URL.Path, c.Writer.Status(), time.Since(started).Milliseconds())
@@ -194,6 +201,7 @@ func setCORSHeaders(c *gin.Context) {
 func authMiddleware(expected string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if c.Request.Method == http.MethodOptions || c.Request.URL.Path == "/health" || c.Request.URL.Path == "/healthz" || c.Request.URL.Path == "/ready" || c.Request.URL.Path == "/readyz" {
+			logDebug("request authentication bypassed: request_id=%s endpoint=%s", c.GetHeader("x-request-id"), c.Request.URL.Path)
 			c.Next()
 			return
 		}
@@ -208,15 +216,30 @@ func authMiddleware(expected string) gin.HandlerFunc {
 			provided = c.GetHeader("x-api-key")
 		}
 		if !constantTimeEqual(provided, expected) {
+			logWarn("request authentication rejected: request_id=%s endpoint=%s credential_source=%s", c.GetHeader("x-request-id"), c.Request.URL.Path, credentialSource(c))
 			writeJSONError(c, http.StatusUnauthorized, "authentication_error", "missing or invalid proxy API key", "")
 			c.Abort()
 			return
 		}
+		logDebug("request authentication accepted: request_id=%s endpoint=%s credential_source=%s", c.GetHeader("x-request-id"), c.Request.URL.Path, credentialSource(c))
 		c.Next()
 	}
 }
 
-func healthHandler(c *gin.Context) { c.JSON(http.StatusOK, map[string]string{"status": "ok"}) }
+func credentialSource(c *gin.Context) string {
+	if c.GetHeader("Authorization") != "" {
+		return "authorization"
+	}
+	if c.GetHeader("x-api-key") != "" {
+		return "x-api-key"
+	}
+	return "none"
+}
+
+func healthHandler(c *gin.Context) {
+	logDebug("health check: request_id=%s", c.GetHeader("x-request-id"))
+	c.JSON(http.StatusOK, map[string]string{"status": "ok"})
+}
 
 func readyHandler(c *gin.Context, state *AppState) {
 	accounts := loadAllAuthTokens(state.Config)
@@ -233,10 +256,12 @@ func readyHandler(c *gin.Context, state *AppState) {
 		status = http.StatusOK
 		statusText = "ready"
 	}
+	logDebug("readiness evaluated: request_id=%s ready=%t configured_accounts=%d", c.GetHeader("x-request-id"), ready, len(accounts))
 	c.JSON(status, map[string]any{"status": statusText, "auth_ready": ready, "configured_accounts": len(accounts)})
 }
 
 func metricsHandler(c *gin.Context, state *AppState) {
+	logDebug("metrics requested: request_id=%s", c.GetHeader("x-request-id"))
 	c.Data(http.StatusOK, "text/plain; version=0.0.4; charset=utf-8", []byte(state.Metrics.Render()))
 }
 

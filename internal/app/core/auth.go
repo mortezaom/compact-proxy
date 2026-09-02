@@ -69,11 +69,13 @@ func loadAuthTokens(path string) (AuthTokens, bool) {
 
 func loadAllAuthTokens(config Config) []AuthTokens {
 	var result []AuthTokens
-	for _, path := range authFilePaths(config) {
+	paths := authFilePaths(config)
+	for _, path := range paths {
 		if tokens, ok := loadAuthTokens(path); ok {
 			result = append(result, tokens)
 		}
 	}
+	logDebug("auth accounts loaded: configured=%d usable_files=%d", len(paths), len(result))
 	return result
 }
 
@@ -491,17 +493,27 @@ func revokeToken(token string) error {
 
 func ensureValidToken(tokens AuthTokens, config Config) (AuthTokens, error) {
 	if !tokens.isExpired() {
+		logDebug("auth account ready: account=%s token_state=valid", tokens.accountAlias())
 		return tokens, nil
 	}
+	logInfo("auth account requires refresh: account=%s", tokens.accountAlias())
 	if tokens.RefreshToken == nil {
+		logWarn("auth account unavailable: account=%s reason=no_refresh_token", tokens.accountAlias())
 		return AuthTokens{}, errors.New("token expired and no refresh token available. Please run `cproxy login`.")
 	}
-	return refreshTokenWithSource(*tokens.RefreshToken, tokens.SourcePath, config)
+	refreshed, err := refreshTokenWithSource(*tokens.RefreshToken, tokens.SourcePath, config)
+	if err != nil {
+		logWarn("auth account refresh failed: account=%s error=%v", tokens.accountAlias(), err)
+		return AuthTokens{}, err
+	}
+	logInfo("auth account refreshed: account=%s", tokens.accountAlias())
+	return refreshed, nil
 }
 
 func loadAndRefreshAuthCandidates(config Config) ([]AuthTokens, error) {
 	tokens := loadAllAuthTokens(config)
 	if len(tokens) == 0 {
+		logWarn("auth candidate scan found no configured accounts")
 		return nil, errors.New("not authenticated. Run `cproxy login`.")
 	}
 	ready := make([]AuthTokens, 0, len(tokens))
@@ -511,12 +523,15 @@ func loadAndRefreshAuthCandidates(config Config) ([]AuthTokens, error) {
 		if err == nil {
 			ready = append(ready, valid)
 		} else {
+			logWarn("auth candidate excluded: account=%s error=%v", token.accountAlias(), err)
 			failures = append(failures, token.accountAlias()+": "+err.Error())
 		}
 	}
 	if len(ready) == 0 {
+		logWarn("auth candidate scan failed: configured=%d usable=0", len(tokens))
 		return nil, fmt.Errorf("no configured auth accounts are usable: %s", strings.Join(failures, "; "))
 	}
+	logDebug("auth candidate scan complete: configured=%d usable=%d excluded=%d", len(tokens), len(ready), len(failures))
 	return ready, nil
 }
 

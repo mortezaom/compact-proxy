@@ -27,14 +27,19 @@ type StreamGuard struct {
 }
 
 func newStreamGuard(metrics *Metrics) *StreamGuard {
-	metrics.ActiveStreams.Add(1)
+	active := metrics.ActiveStreams.Add(1)
+	logDebug("stream metrics opened: active=%d", active)
 	return &StreamGuard{metrics: metrics}
 }
 
 func (g *StreamGuard) complete() { g.completed.Store(true) }
 func (g *StreamGuard) close() {
-	g.metrics.ActiveStreams.Add(^uint64(0))
-	if !g.completed.Load() {
-		g.metrics.CancelledStreamsTotal.Add(1)
+	completed := g.completed.Load()
+	active := g.metrics.ActiveStreams.Add(^uint64(0))
+	if !completed {
+		cancelled := g.metrics.CancelledStreamsTotal.Add(1)
+		logDebug("stream metrics closed: completed=false active=%d cancelled_total=%d", active, cancelled)
+		return
 	}
+	logDebug("stream metrics closed: completed=true active=%d", active)
 }

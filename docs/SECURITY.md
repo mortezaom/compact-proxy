@@ -19,8 +19,9 @@ Treat OAuth access/refresh/ID tokens, auth files, proxy API keys, authorization
 headers, and raw account identifiers as secrets. Upstream authorization always
 comes from local OAuth storage, never from the client's bearer value.
 
-Logs use hashed account aliases and do not include auth-file paths, request
-bodies, prompts, tool arguments, session IDs, or authorization headers. Health,
+Logs use hashed account aliases and short hashes for cache tags; they do not
+include auth-file paths, request bodies, prompts, tool arguments, image data,
+session IDs, or authorization headers. Health,
 readiness, capabilities, metrics, and error responses do not expose OAuth
 tokens or account identities.
 

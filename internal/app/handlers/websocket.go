@@ -24,11 +24,21 @@ type wsMessage struct {
 type websocketSession struct{ lastRequest map[string]any }
 
 func handleResponsesWebSocket(c *gin.Context, state *AppState) {
+	started := time.Now()
+	messageCount := 0
+	requestCount := 0
+	appendCount := 0
+	outcome := "closed"
 	connection, err := websocketUpgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
+		logRequestWarn(c, "responses WebSocket upgrade failed: error=%v", err)
 		return
 	}
-	defer connection.Close()
+	logRequestInfo(c, "responses WebSocket connected")
+	defer func() {
+		logRequestDebug(c, "responses WebSocket closed: outcome=%s messages=%d requests=%d appends=%d duration_ms=%d", outcome, messageCount, requestCount, appendCount, time.Since(started).Milliseconds())
+		_ = connection.Close()
+	}()
 	incoming := make(chan wsMessage, 8)
 	go func() {
 		defer close(incoming)
@@ -42,14 +52,22 @@ func handleResponsesWebSocket(c *gin.Context, state *AppState) {
 	}()
 	session := websocketSession{}
 	for message := range incoming {
+		messageCount++
 		if message.err != nil || message.messageType == websocket.CloseMessage {
+			outcome = "client_disconnected"
+			if message.err != nil {
+				logRequestDebug(c, "responses WebSocket read ended: error=%v", message.err)
+			}
 			return
 		}
 		if message.messageType == websocket.PingMessage {
+			logRequestDebug(c, "responses WebSocket ping received")
 			_ = connection.WriteControl(websocket.PongMessage, message.payload, time.Time{})
 			continue
 		}
 		if message.messageType != websocket.TextMessage {
+			outcome = "protocol_error"
+			logRequestWarn(c, "responses WebSocket rejected frame: message_type=%d payload_bytes=%d", message.messageType, len(message.payload))
 			if sendWSError(connection, "invalid_request_error", "WebSocket requests must be UTF-8 JSON text frames") != nil {
 				return
 			}
@@ -57,12 +75,22 @@ func handleResponsesWebSocket(c *gin.Context, state *AppState) {
 		}
 		request, parseErr := parseWSRequest(message.payload, session.lastRequest)
 		if parseErr != nil {
+			outcome = "protocol_error"
+			logRequestWarn(c, "responses WebSocket request rejected: payload_bytes=%d error=%v", len(message.payload), parseErr)
 			if sendWSError(connection, "invalid_request_error", parseErr.Error()) != nil {
 				return
 			}
 			continue
 		}
+		requestCount++
+		messageType := stringFromAny(messageTypeValue(message.payload))
+		if messageType == "response.append" {
+			appendCount++
+		}
+		logRequestDebug(c, "responses WebSocket request accepted: message_type=%s payload_bytes=%d fields=%d", messageType, len(message.payload), len(request))
 		if value, ok := request["generate"].(bool); ok && !value {
+			outcome = "protocol_error"
+			logRequestWarn(c, "responses WebSocket request rejected: reason=generate_false")
 			if sendWSError(connection, "invalid_request_error", "generate=false is not supported by the HTTP-backed WebSocket bridge") != nil {
 				return
 			}
@@ -70,16 +98,29 @@ func handleResponsesWebSocket(c *gin.Context, state *AppState) {
 		}
 		upstream, upstreamErr := sendJSON(c.Request.Context(), state, c.Request.Header, "responses", request, true)
 		if upstreamErr != nil {
+			outcome = "upstream_error"
+			logRequestWarn(c, "responses WebSocket upstream failed: status=%d type=%s", upstreamErr.Status, upstreamErr.ErrorType)
 			if sendWSError(connection, errorCode(upstreamErr), upstreamErr.Message) != nil {
 				return
 			}
 			continue
 		}
 		session.lastRequest = request
-		if err := streamWebSocketEvents(connection, upstream, incoming, state.Metrics); err != nil {
+		if err := streamWebSocketEvents(connection, upstream, incoming, state.Metrics, requestLogID(c)); err != nil {
+			outcome = "stream_error"
+			logRequestWarn(c, "responses WebSocket stream ended with error: error=%v", err)
 			return
 		}
+		outcome = "completed"
 	}
+}
+
+func messageTypeValue(data []byte) any {
+	var message map[string]any
+	if json.Unmarshal(data, &message) != nil {
+		return "unknown"
+	}
+	return message["type"]
 }
 
 func errorCode(errorValue *UpstreamError) string {
@@ -161,7 +202,14 @@ func mergeWSObjects(target, patch map[string]any) {
 	}
 }
 
-func streamWebSocketEvents(connection *websocket.Conn, upstream *http.Response, incoming <-chan wsMessage, metrics *Metrics) error {
+func streamWebSocketEvents(connection *websocket.Conn, upstream *http.Response, incoming <-chan wsMessage, metrics *Metrics, requestID string) error {
+	started := time.Now()
+	chunkCount := 0
+	eventCount := 0
+	outcome := "client_disconnect"
+	defer func() {
+		logDebug("request_id=%s responses WebSocket stream ended: outcome=%s chunks=%d events=%d duration_ms=%d", requestID, outcome, chunkCount, eventCount, time.Since(started).Milliseconds())
+	}()
 	defer upstream.Body.Close()
 	guard := newStreamGuard(metrics)
 	defer guard.close()
@@ -198,12 +246,14 @@ func streamWebSocketEvents(connection *websocket.Conn, upstream *http.Response, 
 		if json.Unmarshal([]byte(data), &event) != nil {
 			return errors.New("upstream SSE event was not JSON")
 		}
+		eventCount++
 		return connection.WriteMessage(websocket.TextMessage, []byte(data))
 	}
 	for chunks != nil {
 		select {
 		case message, ok := <-incoming:
 			if !ok || message.err != nil {
+				outcome = "client_disconnected"
 				return errors.New("WebSocket client disconnected")
 			}
 			if message.messageType == websocket.PingMessage {
@@ -212,14 +262,18 @@ func streamWebSocketEvents(connection *websocket.Conn, upstream *http.Response, 
 				}
 				continue
 			}
+			outcome = "concurrent_request"
 			return errors.New("concurrent WebSocket requests are not supported")
 		case err := <-readErrors:
+			outcome = "upstream_read_error"
 			return fmt.Errorf("failed to read upstream stream: %w", err)
 		case chunk, ok := <-chunks:
 			if !ok {
 				chunks = nil
+				outcome = "completed"
 				continue
 			}
+			chunkCount++
 			pending = append(pending, chunk...)
 			for {
 				index := bytes.IndexByte(pending, '\n')
@@ -230,15 +284,21 @@ func streamWebSocketEvents(connection *websocket.Conn, upstream *http.Response, 
 				pending = pending[index+1:]
 				line = bytes.TrimSuffix(line, []byte{'\r'})
 				if err := forward(line); err != nil {
+					outcome = "stream_error"
 					return err
 				}
 			}
 		}
 	}
 	if len(pending) > 0 {
+		chunkCount++
 		if err := forward(bytes.TrimSuffix(pending, []byte{'\r'})); err != nil {
+			outcome = "stream_error"
 			return err
 		}
+	}
+	if outcome == "client_disconnect" {
+		outcome = "completed"
 	}
 	guard.complete()
 	return nil

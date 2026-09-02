@@ -11,6 +11,7 @@ func TestLoadConfigAppliesEnvironmentOverFile(t *testing.T) {
 	for _, name := range []string{
 		"HOST",
 		"PORT",
+		"LOG_LEVEL",
 		"CODEX_CLIENT_VERSION",
 		"CODEX_AUTH_FILE",
 		"CODEX_AUTH_FILES",
@@ -28,6 +29,7 @@ func TestLoadConfigAppliesEnvironmentOverFile(t *testing.T) {
 [server]
 host = "0.0.0.0"
 port = 9000
+log_level = "warn"
 codex_version = "file-version"
 
 [auth]
@@ -49,6 +51,7 @@ usage_model = "file-model"
 
 	t.Setenv("HOST", "127.0.0.1")
 	t.Setenv("PORT", "9100")
+	t.Setenv("LOG_LEVEL", "DEBUG")
 	t.Setenv("CODEX_CLIENT_VERSION", "env-version")
 	t.Setenv("CODEX_AUTH_FILE", "env-auth.json")
 	t.Setenv("CODEX_AUTH_FILES", "env-backup-a.json, env-backup-b.json")
@@ -67,6 +70,9 @@ usage_model = "file-model"
 	}
 	if config.Host != "127.0.0.1" || config.Port != 9100 || config.CodexVersion != "env-version" {
 		t.Fatalf("server config = %#v", config)
+	}
+	if config.LogLevel != "debug" {
+		t.Fatalf("LogLevel = %q, want debug", config.LogLevel)
 	}
 	if config.AuthFile != "env-auth.json" || strings.Join(config.AuthFiles, ",") != "env-backup-a.json,env-backup-b.json" {
 		t.Fatalf("auth config = %#v", config)
@@ -101,6 +107,17 @@ func TestLoadConfigRejectsInvalidEnvironment(t *testing.T) {
 	}
 }
 
+func TestLoadConfigRejectsInvalidLogLevel(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "proxy.toml")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LOG_LEVEL", "trace")
+	if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), "unsupported log level") {
+		t.Fatalf("LoadConfig error = %v, want invalid log-level error", err)
+	}
+}
+
 func TestLoadConfigCreatesDefaultUserConfig(t *testing.T) {
 	temporaryHome := t.TempDir()
 	t.Setenv("HOME", temporaryHome)
@@ -109,6 +126,7 @@ func TestLoadConfigCreatesDefaultUserConfig(t *testing.T) {
 		configPathEnv,
 		"HOST",
 		"PORT",
+		"LOG_LEVEL",
 		"CODEX_CLIENT_VERSION",
 		"CODEX_AUTH_FILE",
 		"CODEX_AUTH_FILES",
@@ -129,6 +147,9 @@ func TestLoadConfigCreatesDefaultUserConfig(t *testing.T) {
 	wantConfigPath := filepath.Join(wantDataDir, configFileName)
 	if config.DataDir != wantDataDir {
 		t.Fatalf("DataDir = %q, want %q", config.DataDir, wantDataDir)
+	}
+	if config.LogLevel != "info" {
+		t.Fatalf("LogLevel = %q, want info", config.LogLevel)
 	}
 	if config.ConfigPath != wantConfigPath {
 		t.Fatalf("ConfigPath = %q, want %q", config.ConfigPath, wantConfigPath)

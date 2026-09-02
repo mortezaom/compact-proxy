@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -36,22 +37,30 @@ type CreditsSnapshot struct {
 }
 
 func handleUsage(c *gin.Context, state *AppState) {
+	started := time.Now()
 	model := state.Config.UsageModel
+	logRequestInfo(c, "usage request prepared: model=%s", model)
 	body := map[string]any{"model": model, "instructions": "", "input": []any{map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "hi"}}}}, "store": false, "stream": true}
 	response, upstreamErr := sendJSON(c.Request.Context(), state, c.Request.Header, "responses?client_version="+state.ClientVersion(), body, true)
 	if upstreamErr != nil {
+		logRequestWarn(c, "usage upstream failed: status=%d type=%s", upstreamErr.Status, upstreamErr.ErrorType)
 		c.String(upstreamErr.Status, upstreamErr.Message)
 		return
 	}
 	defer response.Body.Close()
-	snapshots := parseAllRateLimits(response.Header)
+	headerSnapshots := parseAllRateLimits(response.Header)
+	snapshots := append([]RateLimitSnapshot(nil), headerSnapshots...)
 	raw, err := readAll(response.Body)
 	if err != nil {
+		logRequestWarn(c, "usage response read failed: error=%v", err)
 		c.String(http.StatusBadGateway, "failed to read upstream: "+err.Error())
 		return
 	}
-	snapshots = append(snapshots, parseRateLimitEvents(string(raw))...)
+	eventSnapshots := parseRateLimitEvents(string(raw))
+	snapshots = append(snapshots, eventSnapshots...)
+	beforeDedupe := len(snapshots)
 	dedupeRateLimits(&snapshots)
+	logRequestDebug(c, "usage response parsed: status=%d body_bytes=%d header_snapshots=%d event_snapshots=%d deduped=%d final_snapshots=%d duration_ms=%d", response.StatusCode, len(raw), len(headerSnapshots), len(eventSnapshots), beforeDedupe-len(snapshots), len(snapshots), time.Since(started).Milliseconds())
 	c.JSON(http.StatusOK, UsageResponse{Object: "codex.usage", RateLimits: snapshots})
 }
 

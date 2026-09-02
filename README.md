@@ -275,6 +275,7 @@ TOML or environment variables.
 | --- | --- | --- |
 | `server.host` | `127.0.0.1` | Listener bind address. |
 | `server.port` | `8080` | Listener port from `1` through `65535`. |
+| `server.log_level` | `info` | Log verbosity: `debug`, `info`, `warn`, or `error`. |
 | `server.codex_version` | empty | Pin the upstream Codex client version; empty enables discovery. |
 | `auth.file` | `auth.json` | Primary auth file, relative to `~/.compact-proxy`. |
 | `auth.files` | `[]` | Ordered fallback auth files. |
@@ -290,6 +291,7 @@ Example:
 [server]
 host = "127.0.0.1"
 port = 8080
+log_level = "info"
 codex_version = ""
 
 [auth]
@@ -311,6 +313,7 @@ usage_model = "gpt-5.5"
 | --- | --- | --- |
 | `HOST` | `server.host` | Bind address. |
 | `PORT` | `server.port` | Integer from `1` through `65535`. |
+| `LOG_LEVEL` | `server.log_level` | Use `debug` for request and feature tracing. |
 | `CODEX_CLIENT_VERSION` | `server.codex_version` | Pin the upstream client version. |
 | `CODEX_AUTH_FILE` | `auth.file` | Primary auth file. |
 | `CODEX_AUTH_FILES` | `auth.files` | Comma-separated fallback files; replaces the TOML list. |
@@ -446,6 +449,13 @@ print(response)
 - Access tokens refresh before expiry when possible. An upstream `401` gets one
   refresh retry, and configured accounts can be used as bounded fallbacks.
 
+For detailed request monitoring, set `LOG_LEVEL=debug` before starting the
+proxy. Debug logs include request IDs, endpoint/model/reasoning decisions,
+prompt-cache-key source and safe hash, model-cache hit/refresh status,
+account-affinity and failover decisions, upstream timings, and translation or
+stream event counts. The normal `info` level keeps request completion and
+major routing logs.
+
 ## Security and operations
 
 The default loopback bind keeps the service local. If you choose a public bind:
@@ -456,9 +466,10 @@ The default loopback bind keeps the service local. If you choose a public bind:
 - Prefer `PROXY_API_KEY_FILE`, `PROXY_API_KEY`, or a secret manager over an
   inline `security.api_key` in a shared config file.
 
-Logs use request IDs and hashed account aliases. They are designed not to log
-OAuth tokens, proxy keys, full authorization headers, request bodies, prompts,
-tool arguments, or raw account identifiers.
+Logs use request IDs, hashed account aliases, and short hashes for client or
+session cache tags. They are designed not to log OAuth tokens, proxy keys, full
+authorization headers, request bodies, prompts, tool arguments, image data, or
+raw account/session identifiers.
 
 For deeper implementation notes, see:
 

@@ -37,17 +37,38 @@ const (
 func injectPromptCacheKey(headers http.Header, body any) CacheKeySource {
 	object, ok := body.(map[string]any)
 	if !ok {
+		logDebug("prompt cache key decision: request_id=%s source=none reason=non_object_body", requestIDFromHeaders(headers))
 		return CacheKeyNone
 	}
-	if _, exists := object["prompt_cache_key"]; exists {
+	if value, exists := object["prompt_cache_key"]; exists {
+		logDebug("prompt cache key decision: request_id=%s source=client key_id=%s", requestIDFromHeaders(headers), promptCacheKeyLogID(value))
 		return CacheKeyClient
 	}
 	session := sessionKeyFromHeaders(headers)
 	if session == nil {
+		logDebug("prompt cache key decision: request_id=%s source=none session=none", requestIDFromHeaders(headers))
 		return CacheKeyNone
 	}
-	object["prompt_cache_key"] = session.promptCacheKey()
+	cacheKey := session.promptCacheKey()
+	object["prompt_cache_key"] = cacheKey
+	logDebug("prompt cache key decision: request_id=%s source=session session=%s key_id=%s", requestIDFromHeaders(headers), session.logID(), promptCacheKeyLogID(cacheKey))
 	return CacheKeySession
+}
+
+func promptCacheKeyLogID(value any) string {
+	if value == nil {
+		return "none"
+	}
+	text, ok := value.(string)
+	if !ok {
+		return "non_string"
+	}
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return "empty"
+	}
+	digest := sha256.Sum256([]byte(text))
+	return hex.EncodeToString(digest[:6])
 }
 
 type affinityEntry struct {
@@ -89,6 +110,7 @@ func (a *AccountAffinity) order(session *SessionKey, accounts []AuthTokens) bool
 			return true
 		}
 	}
+	logDebug("account affinity entry not usable: session=%s", session.logID())
 	return false
 }
 

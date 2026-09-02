@@ -53,6 +53,7 @@ type Config struct {
 	DataDir                string
 	Host                   string
 	Port                   uint16
+	LogLevel               string
 	CodexVersion           string
 	AuthFile               string
 	AuthFiles              []string
@@ -73,6 +74,7 @@ type fileConfig struct {
 type fileServerConfig struct {
 	Host         *string `toml:"host"`
 	Port         *uint16 `toml:"port"`
+	LogLevel     *string `toml:"log_level"`
 	CodexVersion *string `toml:"codex_version"`
 }
 
@@ -135,6 +137,7 @@ func defaultConfig() Config {
 		DataDir:          dataDir(),
 		Host:             "127.0.0.1",
 		Port:             8080,
+		LogLevel:         "info",
 		ConversationMode: "client",
 		UsageModel:       "gpt-5.5",
 	}
@@ -154,6 +157,7 @@ const defaultConfigContents = `# Default Compact Proxy configuration.
 [server]
 host = "127.0.0.1"
 port = 8080
+log_level = "info"
 codex_version = ""
 
 [auth]
@@ -204,6 +208,9 @@ func applyFileConfig(config *Config, file fileConfig) {
 	if file.Server.Port != nil {
 		config.Port = *file.Server.Port
 	}
+	if file.Server.LogLevel != nil {
+		config.LogLevel = strings.TrimSpace(*file.Server.LogLevel)
+	}
 	if file.Server.CodexVersion != nil {
 		config.CodexVersion = strings.TrimSpace(*file.Server.CodexVersion)
 	}
@@ -240,6 +247,9 @@ func applyEnvironment(config *Config) error {
 			return fmt.Errorf("invalid PORT %q: expected an integer from 1 to 65535", value)
 		}
 		config.Port = uint16(port)
+	}
+	if value := strings.TrimSpace(os.Getenv("LOG_LEVEL")); value != "" {
+		config.LogLevel = value
 	}
 	if value := strings.TrimSpace(os.Getenv("CODEX_CLIENT_VERSION")); value != "" {
 		config.CodexVersion = value
@@ -286,6 +296,13 @@ func validateConfig(config *Config) error {
 	}
 	if config.Port == 0 {
 		return fmt.Errorf("server port must be between 1 and 65535")
+	}
+	config.LogLevel = strings.ToLower(strings.TrimSpace(config.LogLevel))
+	if config.LogLevel == "" {
+		config.LogLevel = "info"
+	}
+	if _, err := parseLogLevel(config.LogLevel); err != nil {
+		return err
 	}
 	config.CodexVersion = strings.TrimSpace(config.CodexVersion)
 	config.DefaultReasoningEffort = strings.ToLower(strings.TrimSpace(config.DefaultReasoningEffort))

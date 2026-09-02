@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -127,20 +128,25 @@ func buildImageResponsesRequest(prompt string, images []string, tool map[string]
 func handleImagesGenerations(c *gin.Context, state *AppState) {
 	var request ImagesGenerationsRequest
 	if err := decodeJSON(c.Request.Body, &request); err != nil {
+		logRequestWarn(c, "image generation rejected: reason=invalid_json error=%v", err)
 		imageError(c, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
 	prompt := strings.TrimSpace(request.Prompt)
 	if prompt == "" {
+		logRequestWarn(c, "image generation rejected: reason=prompt_missing")
 		imageError(c, http.StatusBadRequest, "prompt is required")
 		return
 	}
 	imageModel := resolveImageModel(request.Model)
 	responseFormat := resolveImageResponseFormat(request.ResponseFormat)
 	stream := request.Stream != nil && *request.Stream
+	upstreamModel := resolveMainImageModel(imageModel)
+	logRequestInfo(c, "image request prepared: operation=generation requested_model=%s tool_model=%s upstream_model=%s stream=%t response_format=%s", stringValue(request.Model), imageModel, upstreamModel, stream, responseFormat)
 	params := imageToolParams{Size: request.Size, Quality: request.Quality, Background: request.Background, OutputFormat: request.OutputFormat, OutputCompression: request.OutputCompression, PartialImages: request.PartialImages, Moderation: request.Moderation}
-	upstream, err := sendImageRequest(c, state, buildImageResponsesRequest(prompt, nil, buildImageTool(params), resolveMainImageModel(imageModel)))
+	upstream, err := sendImageRequest(c, state, buildImageResponsesRequest(prompt, nil, buildImageTool(params), upstreamModel))
 	if err != nil {
+		logRequestWarn(c, "image request failed: operation=generation status=%d type=%s", err.Status, err.ErrorType)
 		writeUpstreamError(c, err)
 		return
 	}
@@ -154,29 +160,35 @@ func handleImagesGenerations(c *gin.Context, state *AppState) {
 func handleImagesEdits(c *gin.Context, state *AppState) {
 	body, err := io.ReadAll(io.LimitReader(c.Request.Body, 10*1024*1024+1))
 	if err != nil {
+		logRequestWarn(c, "image edit rejected: reason=body_read_failed error=%v", err)
 		imageError(c, http.StatusBadRequest, "failed to read body: "+err.Error())
 		return
 	}
 	if len(body) > 10*1024*1024 {
+		logRequestWarn(c, "image edit rejected: reason=body_too_large body_bytes=%d", len(body))
 		imageError(c, http.StatusBadRequest, "request body is too large")
 		return
 	}
 	contentType := strings.ToLower(c.GetHeader("Content-Type"))
 	if strings.Contains(contentType, "application/json") {
+		logRequestDebug(c, "image edit request received: encoding=json body_bytes=%d", len(body))
 		var request ImagesEditsJSONRequest
 		if err := json.Unmarshal(body, &request); err != nil {
+			logRequestWarn(c, "image edit rejected: encoding=json reason=invalid_json error=%v", err)
 			imageError(c, http.StatusBadRequest, "invalid JSON: "+err.Error())
 			return
 		}
 		handleImagesEditsJSON(c, state, request)
 		return
 	}
+	logRequestDebug(c, "image edit request received: encoding=multipart body_bytes=%d", len(body))
 	handleImagesEditsMultipart(c, state, body, contentType)
 }
 
 func handleImagesEditsJSON(c *gin.Context, state *AppState, request ImagesEditsJSONRequest) {
 	prompt := strings.TrimSpace(request.Prompt)
 	if prompt == "" {
+		logRequestWarn(c, "image edit rejected: encoding=json reason=prompt_missing")
 		imageError(c, http.StatusBadRequest, "prompt is required")
 		return
 	}
@@ -187,6 +199,7 @@ func handleImagesEditsJSON(c *gin.Context, state *AppState, request ImagesEditsJ
 		}
 	}
 	if len(images) == 0 {
+		logRequestWarn(c, "image edit rejected: encoding=json reason=images_missing")
 		imageError(c, http.StatusBadRequest, "images[].image_url is required")
 		return
 	}
@@ -197,21 +210,27 @@ func handleImagesEditsJSON(c *gin.Context, state *AppState, request ImagesEditsJ
 	}
 	params := imageToolParams{Size: request.Size, Quality: request.Quality, Background: request.Background, OutputFormat: request.OutputFormat, OutputCompression: request.OutputCompression, PartialImages: request.PartialImages, InputFidelity: request.InputFidelity, Moderation: request.Moderation, MaskImageURL: mask}
 	imageModel := resolveImageModel(request.Model)
-	upstream, err := sendImageRequest(c, state, buildImageResponsesRequest(prompt, images, buildImageTool(params), resolveMainImageModel(imageModel)))
+	upstreamModel := resolveMainImageModel(imageModel)
+	responseFormat := resolveImageResponseFormat(request.ResponseFormat)
+	stream := request.Stream != nil && *request.Stream
+	logRequestInfo(c, "image request prepared: operation=edit encoding=json requested_model=%s tool_model=%s upstream_model=%s input_images=%d stream=%t response_format=%s", stringValue(request.Model), imageModel, upstreamModel, len(images), stream, responseFormat)
+	upstream, err := sendImageRequest(c, state, buildImageResponsesRequest(prompt, images, buildImageTool(params), upstreamModel))
 	if err != nil {
+		logRequestWarn(c, "image request failed: operation=edit encoding=json status=%d type=%s", err.Status, err.ErrorType)
 		writeUpstreamError(c, err)
 		return
 	}
-	if request.Stream != nil && *request.Stream {
-		streamImages(c, upstream, resolveImageResponseFormat(request.ResponseFormat), "image_edit", state.Metrics)
+	if stream {
+		streamImages(c, upstream, responseFormat, "image_edit", state.Metrics)
 	} else {
-		collectImages(c, upstream, resolveImageResponseFormat(request.ResponseFormat))
+		collectImages(c, upstream, responseFormat)
 	}
 }
 
 func handleImagesEditsMultipart(c *gin.Context, state *AppState, body []byte, contentType string) {
 	_, mediaParams, err := mime.ParseMediaType(contentType)
 	if err != nil || mediaParams["boundary"] == "" {
+		logRequestWarn(c, "image edit rejected: encoding=multipart reason=boundary_missing")
 		imageError(c, http.StatusBadRequest, "invalid Content-Type: missing multipart boundary")
 		return
 	}
@@ -223,11 +242,13 @@ func handleImagesEditsMultipart(c *gin.Context, state *AppState, body []byte, co
 			break
 		}
 		if readErr != nil {
+			logRequestWarn(c, "image edit rejected: encoding=multipart reason=part_parse_failed error=%v", readErr)
 			imageError(c, http.StatusBadRequest, "failed to parse multipart: "+readErr.Error())
 			return
 		}
 		data, _ := io.ReadAll(io.LimitReader(part, 10*1024*1024+1))
 		if len(data) > 10*1024*1024 {
+			logRequestWarn(c, "image edit rejected: encoding=multipart reason=field_too_large field=%s bytes=%d", part.FormName(), len(data))
 			imageError(c, http.StatusBadRequest, "multipart field is too large")
 			return
 		}
@@ -243,6 +264,7 @@ func handleImagesEditsMultipart(c *gin.Context, state *AppState, body []byte, co
 	}
 	prompt := strings.TrimSpace(fields["prompt"])
 	if prompt == "" {
+		logRequestWarn(c, "image edit rejected: encoding=multipart reason=prompt_missing")
 		imageError(c, http.StatusBadRequest, "prompt is required")
 		return
 	}
@@ -254,18 +276,23 @@ func handleImagesEditsMultipart(c *gin.Context, state *AppState, body []byte, co
 		images = append(images, image)
 	}
 	if len(images) == 0 {
+		logRequestWarn(c, "image edit rejected: encoding=multipart reason=images_missing")
 		imageError(c, http.StatusBadRequest, "image is required")
 		return
 	}
 	imageModel := resolveImageModel(pointerIfNonEmpty(fields["model"]))
 	responseFormat := resolveImageResponseFormat(pointerIfNonEmpty(fields["response_format"]))
+	upstreamModel := resolveMainImageModel(imageModel)
+	stream := strings.EqualFold(fields["stream"], "true")
+	logRequestInfo(c, "image request prepared: operation=edit encoding=multipart requested_model=%s tool_model=%s upstream_model=%s input_images=%d stream=%t response_format=%s", fields["model"], imageModel, upstreamModel, len(images), stream, responseFormat)
 	params := imageToolParams{Size: pointerIfNonEmpty(fields["size"]), Quality: pointerIfNonEmpty(fields["quality"]), Background: pointerIfNonEmpty(fields["background"]), OutputFormat: pointerIfNonEmpty(fields["output_format"]), OutputCompression: parseUintPointer(fields["output_compression"]), PartialImages: parseUintPointer(fields["partial_images"]), InputFidelity: pointerIfNonEmpty(fields["input_fidelity"]), Moderation: pointerIfNonEmpty(fields["moderation"]), MaskImageURL: pointerIfNonEmpty(fields["mask"])}
-	upstream, upstreamErr := sendImageRequest(c, state, buildImageResponsesRequest(prompt, images, buildImageTool(params), resolveMainImageModel(imageModel)))
+	upstream, upstreamErr := sendImageRequest(c, state, buildImageResponsesRequest(prompt, images, buildImageTool(params), upstreamModel))
 	if upstreamErr != nil {
+		logRequestWarn(c, "image request failed: operation=edit encoding=multipart status=%d type=%s", upstreamErr.Status, upstreamErr.ErrorType)
 		writeUpstreamError(c, upstreamErr)
 		return
 	}
-	if strings.EqualFold(fields["stream"], "true") {
+	if stream {
 		streamImages(c, upstream, responseFormat, "image_edit", state.Metrics)
 	} else {
 		collectImages(c, upstream, responseFormat)
@@ -288,7 +315,8 @@ func parseUintPointer(value string) *uint64 {
 }
 
 func sendImageRequest(c *gin.Context, state *AppState, body map[string]any) (*http.Response, *UpstreamError) {
-	injectPromptCacheKey(c.Request.Header, body)
+	cacheSource := injectPromptCacheKey(c.Request.Header, body)
+	logRequestDebug(c, "image upstream request: model=%s input_items=%d cache_key_source=%s cache_key_id=%s", stringFromAny(body["model"]), lenAnySlice(body["input"]), cacheSource, promptCacheKeyLogID(body["prompt_cache_key"]))
 	return sendJSON(c.Request.Context(), state, c.Request.Header, "responses", body, true)
 }
 
@@ -321,14 +349,24 @@ func imageUsageFromEvent(event map[string]any) any {
 }
 
 func collectImages(c *gin.Context, upstream *http.Response, responseFormat string) {
+	started := time.Now()
+	eventCount := 0
+	invalidEventCount := 0
+	resultCount := 0
+	outcome := "error"
+	defer func() {
+		logRequestDebug(c, "image collection ended: outcome=%s status=%d response_format=%s events=%d invalid_events=%d results=%d duration_ms=%d", outcome, upstream.StatusCode, responseFormat, eventCount, invalidEventCount, resultCount, time.Since(started).Milliseconds())
+	}()
 	defer upstream.Body.Close()
 	if upstream.StatusCode < 200 || upstream.StatusCode >= 300 {
 		body, _ := io.ReadAll(upstream.Body)
+		logRequestWarn(c, "image collection received upstream error: status=%d body_bytes=%d", upstream.StatusCode, len(body))
 		imageError(c, upstream.StatusCode, string(body))
 		return
 	}
 	raw, err := io.ReadAll(upstream.Body)
 	if err != nil {
+		logRequestWarn(c, "image collection read failed: error=%v", err)
 		imageError(c, http.StatusBadGateway, "failed to read upstream: "+err.Error())
 		return
 	}
@@ -338,8 +376,10 @@ func collectImages(c *gin.Context, upstream *http.Response, responseFormat strin
 	for _, data := range dataLines(string(raw)) {
 		var event map[string]any
 		if json.Unmarshal([]byte(data), &event) != nil {
+			invalidEventCount++
 			continue
 		}
+		eventCount++
 		switch event["type"] {
 		case "response.completed":
 			if response, ok := event["response"].(map[string]any); ok {
@@ -349,21 +389,25 @@ func collectImages(c *gin.Context, upstream *http.Response, responseFormat strin
 			}
 			if completed := imageResultsFromCompleted(event); len(completed) > 0 {
 				results = completed
+				resultCount = len(completed)
 			}
 			usage = imageUsageFromEvent(event)
 		case "response.output_item.done":
 			if item, ok := event["item"].(map[string]any); ok && item["type"] == "image_generation_call" {
 				if image, ok := imageResultFromItem(item); ok {
 					results = append(results, image)
+					resultCount++
 				}
 			}
 		}
 	}
 	if len(results) == 0 {
+		logRequestWarn(c, "image collection produced no image output")
 		imageError(c, http.StatusBadGateway, "upstream did not return image output")
 		return
 	}
 	c.JSON(http.StatusOK, buildImagesResponse(results, responseFormat, created, usage))
+	outcome = "completed"
 }
 
 func mimeTypeForImage(format string) string {
@@ -414,6 +458,16 @@ func buildImagesResponse(results []imageCallResult, responseFormat string, creat
 }
 
 func streamImages(c *gin.Context, upstream *http.Response, responseFormat, prefix string, metrics *Metrics) {
+	started := time.Now()
+	frameCount := 0
+	eventCount := 0
+	invalidEventCount := 0
+	partialCount := 0
+	completedCount := 0
+	outcome := "client_disconnect"
+	defer func() {
+		logRequestDebug(c, "image stream ended: outcome=%s prefix=%s response_format=%s frames=%d events=%d invalid_events=%d partial_images=%d completed_images=%d duration_ms=%d", outcome, prefix, responseFormat, frameCount, eventCount, invalidEventCount, partialCount, completedCount, time.Since(started).Milliseconds())
+	}()
 	defer upstream.Body.Close()
 	guard := newStreamGuard(metrics)
 	defer guard.close()
@@ -432,18 +486,22 @@ func streamImages(c *gin.Context, upstream *http.Response, responseFormat, prefi
 		return nil
 	}
 	err := streamSSEBody(upstream.Body, func(frame string) error {
+		frameCount++
 		var output strings.Builder
 		for _, data := range sseData(frame) {
 			var event map[string]any
 			if json.Unmarshal([]byte(data), &event) != nil {
+				invalidEventCount++
 				continue
 			}
+			eventCount++
 			switch event["type"] {
 			case "response.image_generation_call.partial_image":
 				b64 := stringFromAny(event["partial_image_b64"])
 				if b64 == "" {
 					continue
 				}
+				partialCount++
 				format := stringFromAny(event["output_format"])
 				index := uint64FromAny(event["partial_image_index"])
 				name := prefix + ".partial_image"
@@ -463,6 +521,7 @@ func streamImages(c *gin.Context, upstream *http.Response, responseFormat, prefi
 				if !ok {
 					continue
 				}
+				completedCount++
 				name := prefix + ".completed"
 				payload := map[string]any{"type": name}
 				if responseFormat == "url" {
@@ -482,6 +541,7 @@ func streamImages(c *gin.Context, upstream *http.Response, responseFormat, prefi
 				usage := imageUsageFromEvent(event)
 				name := prefix + ".completed"
 				for _, image := range results {
+					completedCount++
 					payload := map[string]any{"type": name}
 					if responseFormat == "url" {
 						payload["url"] = "data:" + mimeTypeForImage(image.OutputFormat) + ";base64," + image.Result
@@ -501,13 +561,17 @@ func streamImages(c *gin.Context, upstream *http.Response, responseFormat, prefi
 		return write(output.String())
 	})
 	if err != nil {
+		outcome = "stream_error"
+		logRequestWarn(c, "image stream failed: prefix=%s error=%v", prefix, err)
 		_ = write("event: error\ndata: " + mustJSON(map[string]any{"error": map[string]any{"message": err.Error()}}) + "\n\n")
 		return
 	}
+	outcome = "completed"
 	guard.complete()
 }
 
 func mustJSON(value any) string { data, _ := json.Marshal(value); return string(data) }
 func imageError(c *gin.Context, status int, message string) {
+	logRequestDebug(c, "image error response: status=%d", status)
 	c.JSON(status, map[string]any{"error": map[string]any{"message": message, "type": "invalid_request_error"}})
 }
